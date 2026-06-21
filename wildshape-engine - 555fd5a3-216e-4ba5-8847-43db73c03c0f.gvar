@@ -1,0 +1,759 @@
+# =====================================================================
+# wildshape-engine  -  All logic for the !wildshape collection
+# ---------------------------------------------------------------------
+# Thin subcommand aliases call into here, e.g.:
+#     using (engine = "ENGINE-GVAR-ID")
+#     return engine.transform(&ARGS&)
+#
+# Design notes:
+#  * Stats are read live from character() on every call: druid level, WIS,
+#    proficiency, saves, skills. Subclass and the Elemental Fury option are
+#    stored once via setup (chosen at levels 3 and 7).
+#  * Beast data is captured once via !init madd (see scan/learn) and kept
+#    in per-form cvars forever.
+#  * In combat, an init effect overlays AC / resistances / per-ability
+#    save bonuses / the beast's attacks, plus a "Revert" button.
+# =====================================================================
+
+using (profiles = "eb6de7da-50ee-4ad9-8b02-2a91cc850c40")
+
+SCAN_NAME = "WS Scan"
+CC_NAME = "Wild Shape"
+ABILITIES = ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+ABBR = {"strength": "str", "dexterity": "dex", "constitution": "con",
+        "intelligence": "int", "wisdom": "wis", "charisma": "cha"}
+SKILLS = {
+    "acrobatics": "acrobatics", "animalHandling": "animal handling", "arcana": "arcana",
+    "athletics": "athletics", "deception": "deception", "history": "history",
+    "insight": "insight", "intimidation": "intimidation", "investigation": "investigation",
+    "medicine": "medicine", "nature": "nature", "perception": "perception",
+    "performance": "performance", "persuasion": "persuasion", "religion": "religion",
+    "sleightOfHand": "sleight of hand", "stealth": "stealth", "survival": "survival",
+}
+
+# ---------------------------------------------------------------------
+# small utilities
+# ---------------------------------------------------------------------
+
+def slugify(s):
+    s = str(s).lower().strip()
+    for chx in [" ", "-", "'", ".", ",", ":", ";", "(", ")", "/", "\""]:
+        s = s.replace(chx, "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+def positional(args):
+    # tokens that are not flags or flag-values
+    out = []
+    flag_vals = ["cr", "as", "size", "b", "t", "subclass", "fury", "color", "image", "thumb", "rider", "l"]
+    i = 0
+    while i < len(args):
+        a = str(args[i])
+        if a.startswith("-"):
+            key = a[1:]
+            if key in flag_vals:
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+def name_and_rest(args):
+    # leading non-flag tokens = name; everything from first flag on = rest
+    idx = len(args)
+    for i in range(len(args)):
+        if str(args[i]).startswith("-"):
+            idx = i
+            break
+    name = " ".join([str(x) for x in args[:idx]]).strip()
+    rest = args[idx:]
+    return name, rest
+
+def norm_skill(s):
+    t = str(s).lower().replace(" ", "").replace("_", "")
+    for k in SKILLS:
+        if k.lower() == t:
+            return k
+        if SKILLS[k].lower().replace(" ", "") == t:
+            return k
+    return None
+
+def norm_abil(s):
+    t = str(s).lower()
+    for f in ABILITIES:
+        if f == t or ABBR[f] == t or (len(t) >= 3 and f.startswith(t)):
+            return f
+    return None
+
+# ---------------------------------------------------------------------
+# persistent state (per-character cvars)
+# ---------------------------------------------------------------------
+
+def load_config():
+    raw = character().get_cvar("ws_config")
+    c = load_json(raw) if raw else {}
+    if "subclass" not in c: c["subclass"] = "base"
+    if "elemental_fury" not in c: c["elemental_fury"] = None
+    if "color" not in c: c["color"] = "#3b7a57"
+    if "thumb" not in c: c["thumb"] = None
+    if "image" not in c: c["image"] = None
+    return c
+
+def save_config(c):
+    character().set_cvar("ws_config", dump_json(c))
+
+def druid_level(c):
+    if c.get("level_override"):
+        return int(c["level_override"])
+    return int(character().levels.get("Druid") or 0)
+
+def wis_mod(c):
+    if c.get("wis_override") is not None:
+        return int(c["wis_override"])
+    return int(character().stats.get_mod("wisdom"))
+
+def load_index():
+    raw = character().get_cvar("ws_forms")
+    return load_json(raw) if raw else []
+
+def save_index(idx):
+    character().set_cvar("ws_forms", dump_json(idx))
+
+def form_cvar(slug):
+    return "ws_form_" + slug
+
+def load_form(slug):
+    raw = character().get_cvar(form_cvar(slug))
+    return load_json(raw) if raw else None
+
+def save_form(slug, data):
+    character().set_cvar(form_cvar(slug), dump_json(data))
+
+def find_form(name):
+    idx = load_index()
+    n = slugify(name)
+    nl = str(name).lower().strip()
+    for f in idx:
+        if f["slug"] == n:
+            return f
+    for f in idx:
+        if f["name"].lower() == nl:
+            return f
+    for f in idx:
+        if nl and (nl in f["name"].lower() or n in f["slug"] or f["slug"] in n):
+            return f
+    return None
+
+def load_state():
+    raw = character().get_cvar("ws_state")
+    return load_json(raw) if raw else None
+
+def save_state(s):
+    character().set_cvar("ws_state", dump_json(s))
+
+def clear_state():
+    if character().get_cvar("ws_state"):
+        character().delete_cvar("ws_state")
+
+def effect_name(disp):
+    return "Wild Shape: " + disp
+
+def active_state():
+    # returns state dict if shaped, else None; reconciles vs the live init effect
+    s = load_state()
+    if not s:
+        return None
+    cb = combat()
+    if cb and cb.me:
+        if not cb.me.get_effect(effect_name(s.get("name", ""))):
+            clear_state()
+            return None
+    return s
+
+# ---------------------------------------------------------------------
+# uses counter
+# ---------------------------------------------------------------------
+
+def ensure_counter(level):
+    ch = character()
+    mx = profiles.uses_max(level)
+    if mx <= 0:
+        return False
+    if ch.cc_exists(CC_NAME):
+        try:
+            if ch.get_cc_max(CC_NAME) != mx:
+                ch.edit_cc(CC_NAME, maxVal=mx)
+        except:
+            pass
+    else:
+        ch.create_cc_nx(CC_NAME, minVal=0, maxVal=mx, reset="long", dispType="bubble",
+            title="Wild Shape Uses",
+            desc="Uses of Wild Shape. Regain 1 on a Short Rest, all on a Long Rest.")
+    return True
+
+def spend_use(level, n):
+    ch = character()
+    if not ensure_counter(level):
+        return ""
+    cur = ch.get_cc(CC_NAME)
+    if cur < n:
+        return f"Not enough Wild Shape uses ({ch.cc_str(CC_NAME)})."
+    ch.mod_cc(CC_NAME, -n)
+    return f"**Wild Shape**: {ch.cc_str(CC_NAME)} (-{n})"
+
+# ---------------------------------------------------------------------
+# capture (scan + learn)
+# ---------------------------------------------------------------------
+
+def read_save(sb, a):
+    # sb = an AliasSaves; a = full ability name. Returns int modifier or None.
+    for key in [ABBR[a], a]:
+        try:
+            return int(sb.get(key).value)
+        except:
+            pass
+    return None
+
+def scan(args):
+    pa = argparse(args)
+    beast = " ".join([str(x) for x in positional(args)]).strip()
+    if not beast:
+        err("Usage: `!wildshape scan <beast name> [-cr 1/4] [-fly] [-size Medium]`  (you must be in combat).")
+    if not combat():
+        err("Start initiative first (`!init begin`), then `!wildshape scan <beast>`. The beast is added to combat so its real stat block can be read.")
+    cr = pa.last("cr")
+    fly = ("-fly" in args) or ("fly" in args)
+    size = pa.last("size")
+    character().set_cvar("ws_scan_meta", dump_json({"cr": cr, "fly": bool(fly), "size": size, "beast": beast}))
+    c = load_config()
+    p = ctx.prefix
+    hint = f'embed -title "Scanning {beast}" -desc "Added to initiative (hidden). Run `!wildshape learn` to save it as a known form. Add `-as Name` to rename." {wrap(c)}'
+    return f'multiline\n{p}init madd "{beast}" -name "{SCAN_NAME}" -h\n{p}{hint}'
+
+def capture(scan_cb, disp, slug, cr, fly, size):
+    stats = {}
+    for a in ABILITIES:
+        try:
+            stats[a] = {"score": int(scan_cb.stats.get(a)), "mod": int(scan_cb.stats.get_mod(a))}
+        except:
+            stats[a] = {"score": 10, "mod": 0}
+    try:
+        stats["prof_bonus"] = int(scan_cb.stats.prof_bonus)
+    except:
+        stats["prof_bonus"] = 2
+    saves = {}
+    for a in ABILITIES:
+        v = read_save(scan_cb.saves, a)
+        saves[a] = v if v is not None else stats[a]["mod"]
+    skills = {}
+    for k in SKILLS:
+        try:
+            skills[k] = int(scan_cb.skills[k].value)
+        except:
+            pass
+    attacks = []
+    try:
+        for atk in scan_cb.attacks:
+            attacks.append(atk.raw)
+    except:
+        pass
+    res = {"resist": [], "immune": [], "vuln": []}
+    try:
+        res["resist"] = [str(r) for r in scan_cb.resistances.resist]
+        res["immune"] = [str(r) for r in scan_cb.resistances.immune]
+        res["vuln"] = [str(r) for r in scan_cb.resistances.vuln]
+    except:
+        pass
+    ac = None
+    try: ac = int(scan_cb.ac)
+    except: pass
+    mhp = None
+    try: mhp = int(scan_cb.max_hp)
+    except: pass
+    ctype = None
+    try: ctype = scan_cb.creature_type
+    except: pass
+    return {
+        "name": disp, "slug": slug, "cr": cr, "fly": bool(fly), "size": size,
+        "creature_type": ctype, "ac": ac, "max_hp": mhp,
+        "stats": stats, "saves": saves, "skills": skills,
+        "attacks": attacks, "resist": res,
+    }
+
+def learn(args):
+    pa = argparse(args)
+    cb = combat()
+    if not cb:
+        err("You must be in combat with a scanned beast. Run `!wildshape scan <beast>` first.")
+    scan_cb = cb.get_combatant(SCAN_NAME)
+    if not scan_cb:
+        err("No scanned beast found. Run `!wildshape scan <beast>` first (in combat).")
+    c = load_config()
+    level = druid_level(c)
+    raw_meta = character().get_cvar("ws_scan_meta")
+    meta = load_json(raw_meta) if raw_meta else {"cr": None, "fly": False, "size": None}
+    disp = pa.last("as") or scan_cb.monster_name or scan_cb.name or "Beast"
+    if disp == SCAN_NAME:
+        disp = scan_cb.monster_name or "Beast"
+    cr = pa.last("cr") or meta.get("cr")
+    fly = ("-fly" in args) or ("fly" in args) or meta.get("fly")
+    size = pa.last("size") or meta.get("size")
+    slug = slugify(disp)
+    data = capture(scan_cb, disp, slug, cr, fly, size)
+    save_form(slug, data)
+    idx = load_index()
+    idx = [f for f in idx if f["slug"] != slug]
+    idx.append({"name": disp, "slug": slug, "cr": cr, "fly": bool(fly), "size": size})
+    save_index(idx)
+    if raw_meta:
+        character().delete_cvar("ws_scan_meta")
+
+    warn = eligibility_note(c, level, idx, data)
+    p = profiles.get(c["subclass"])
+    crv = profiles.parse_cr(cr)
+    crs = profiles.format_cr(crv) if crv is not None else (cr or "?")
+    atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
+    out = f'embed -title "Learned Form: {disp}" '
+    out += f'-f "Known Forms|{len(idx)} / {profiles.known_max(level)}|inline" '
+    out += f'-f "Challenge Rating|{crs} (max {profiles.format_cr(profiles.max_cr(c["subclass"], level))})|inline" '
+    out += f'-f "Stat Block|AC {data["ac"]} • HP {data["max_hp"]} • {data["creature_type"] or "beast"}" '
+    out += f'-f "Attacks|{atk_names}" '
+    if warn:
+        out += f'-f "Note|{warn}" '
+    out += f'-color {c["color"]} '
+    p = ctx.prefix
+    return f'multiline\n{p}init remove -name "{SCAN_NAME}"\n{p}{out}'
+
+def eligibility_note(c, level, idx, data):
+    notes = []
+    maxcr = profiles.max_cr(c["subclass"], level)
+    crv = profiles.parse_cr(data["cr"])
+    if crv is None:
+        notes.append("CR unknown. Pass `-cr` to enable the eligibility check.")
+    elif crv > maxcr:
+        notes.append(f"CR {profiles.format_cr(crv)} exceeds your max of {profiles.format_cr(maxcr)}.")
+    if data["fly"] and not profiles.fly_allowed(level):
+        notes.append("This form has a Fly Speed, which you can't use until Druid level 8.")
+    if len(idx) > profiles.known_max(level):
+        notes.append(f"You now know {len(idx)} forms but can only keep {profiles.known_max(level)}. Use `!wildshape forget <name>`.")
+    return " ".join(notes)
+
+# ---------------------------------------------------------------------
+# forms management
+# ---------------------------------------------------------------------
+
+def forms(args):
+    c = load_config()
+    level = druid_level(c)
+    idx = load_index()
+    if not idx:
+        return f'embed -title "Known Forms" -desc "You haven\'t learned any forms yet. In combat: `!wildshape scan <beast>` then `!wildshape learn`." -color {c["color"]}'
+    lines = ""
+    for f in idx:
+        crs = profiles.format_cr(profiles.parse_cr(f["cr"])) if f.get("cr") else "?"
+        fly = ", fly" if f.get("fly") else ""
+        lines += f'**{f["name"]}**: CR {crs}{fly}\n'
+    desc = f'Known: {len(idx)} / {profiles.known_max(level)}  |  Max CR: {profiles.format_cr(profiles.max_cr(c["subclass"], level))}  |  Fly: {"yes" if profiles.fly_allowed(level) else "no (L8+)"}'
+    return f'embed -title "Known Forms: {profiles.get(c["subclass"])["name"]} (Lv {level})" -desc "{desc}" -f "Forms|{lines}" -color {c["color"]}'
+
+def forget(args):
+    c = load_config()
+    name, rest = name_and_rest(args)
+    f = find_form(name)
+    if not f:
+        err(f"No known form matches '{name}'. See `!wildshape forms`.")
+    idx = [x for x in load_index() if x["slug"] != f["slug"]]
+    save_index(idx)
+    if character().get_cvar(form_cvar(f["slug"])):
+        character().delete_cvar(form_cvar(f["slug"]))
+    return f'embed -title "Forgot Form: {f["name"]}" -desc "Removed from your known forms ({len(idx)} remaining)." -color {c["color"]}'
+
+def swap(args):
+    # !wildshape swap <oldname> for <newbeast>  -> forget old, then scan new
+    c = load_config()
+    parts = [str(x) for x in positional(args)]
+    joined = " ".join(parts)
+    old = joined
+    new = None
+    if " for " in joined.lower():
+        i = joined.lower().find(" for ")
+        old = joined[:i].strip()
+        new = joined[i + 5:].strip()
+    f = find_form(old)
+    if not f:
+        err(f"No known form matches '{old}'. See `!wildshape forms`.")
+    idx = [x for x in load_index() if x["slug"] != f["slug"]]
+    save_index(idx)
+    if character().get_cvar(form_cvar(f["slug"])):
+        character().delete_cvar(form_cvar(f["slug"]))
+    if new:
+        return scan([new])
+    return f'embed -title "Swapped out {f["name"]}" -desc "Now `!wildshape scan <new beast>` then `!wildshape learn` to add its replacement." -color {c["color"]}'
+
+# ---------------------------------------------------------------------
+# transform / revert
+# ---------------------------------------------------------------------
+
+def revert_button():
+    auto = [
+        {"type": "remove_ieffect"},
+        {"type": "target", "target": "self", "effects": [{"type": "temphp", "amount": "0"}]},
+        {"type": "text", "text": "You shift back to your true form."},
+    ]
+    return {"label": "Revert", "verb": "reverts to their true form", "style": 4, "automation": auto}
+
+def save_bonus_string(c, data, p, level, wis):
+    mods = profiles.save_mods(p, level, wis)
+    segs = []
+    for a in ABILITIES:
+        cv = read_save(character().saves, a)
+        if cv is None:
+            continue
+        char_v = cv
+        beast_v = int(data["saves"].get(a, char_v))
+        delta = max(0, beast_v - char_v)
+        total = delta + int(mods.get(a, 0))
+        if total != 0:
+            segs.append(f"{total}|{ABBR[a]}")
+    return "+".join(segs)
+
+def apply_overlay(me, c, p, level, data):
+    wis = wis_mod(c)
+    for e in me.effects:
+        if e.name.startswith("Wild Shape:"):
+            me.remove_effect(e.name)
+    passive = {}
+    if data["ac"] is not None:
+        passive["ac_value"] = profiles.ac_value(p, data["ac"], wis)
+    if data["resist"]["resist"]:
+        passive["resistances"] = data["resist"]["resist"]
+    if data["resist"]["immune"]:
+        passive["immunities"] = data["resist"]["immune"]
+    if data["resist"]["vuln"]:
+        passive["vulnerabilities"] = data["resist"]["vuln"]
+    sb = save_bonus_string(c, data, p, level, wis)
+    if sb:
+        passive["save_bonus"] = sb
+    atks = [{"attack": a} for a in data["attacks"]]
+    desc = f"Wild Shape ({data['name']}). Press Revert to end, or `!wildshape revert`."
+    me.add_effect(effect_name(data["name"]), passive_effects=passive, attacks=atks,
+        buttons=[revert_button()], desc=desc)
+
+def transform(args):
+    c = load_config()
+    level = druid_level(c)
+    if level < 2:
+        err("You need Druid level 2 to use Wild Shape.")
+    name, rest = name_and_rest(args)
+    if not name:
+        return status(c)
+    f = find_form(name)
+    if not f:
+        err(f"You don't know a form called '{name}'. See `!wildshape forms`, or learn it with `!wildshape scan`/`learn`.")
+    data = load_form(f["slug"])
+    if not data:
+        err(f"Form data for '{f['name']}' is missing. Re-learn it with `!wildshape scan`/`learn`.")
+    p = profiles.get(c["subclass"])
+    spent = spend_use(level, 1)
+    thp = profiles.temp_hp(p, level)
+    character().set_temp_hp(thp)
+    cb = combat()
+    in_combat = bool(cb and cb.me)
+    if in_combat:
+        apply_overlay(cb.me, c, p, level, data)
+    save_state({"active_slug": f["slug"], "name": data["name"], "applied_thp": thp, "level_at": level})
+    return transform_embed(c, p, level, data, thp, spent, in_combat)
+
+def transform_embed(c, p, level, data, thp, spent, in_combat):
+    wis = wis_mod(c)
+    name = character().name
+    phys = f'STR {fmt(data["stats"]["strength"]["mod"])} • DEX {fmt(data["stats"]["dexterity"]["mod"])} • CON {fmt(data["stats"]["constitution"]["mod"])}'
+    ac = profiles.ac_value(p, data["ac"], wis) if data["ac"] is not None else "?"
+    atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
+    out = f'embed -title "{name} Wild Shapes into a {data["name"]}" '
+    out += f'-f "Temp HP|{thp}|inline" '
+    out += f'-f "AC|{ac}|inline" '
+    out += f'-f "Type|{data["creature_type"] or "Beast"}|inline" '
+    out += f'-f "Beast Stats|{phys}" '
+    out += f'-f "Attacks|{atk_names}" '
+    out += f'-f "Reminder|{profiles.cast_while_shaped(p, level)}\nRetained: HP, Hit Dice, INT/WIS/CHA, class features, feats. Revert as a Bonus Action." '
+    if spent:
+        out += f'-f "Uses|{spent}|inline" '
+    if not in_combat:
+        out += f'-f "Out of combat|Temp HP applied. Use in initiative to apply AC, resistances, saves, and attacks." '
+    hint = subclass_hint(c, level)
+    if hint:
+        out += f'-f "Set your subclass|{hint}" '
+    out += wrap(c)
+    return out
+
+def revert(args):
+    c = load_config()
+    s = load_state()
+    cb = combat()
+    removed = False
+    if cb and cb.me:
+        for e in cb.me.effects:
+            if e.name.startswith("Wild Shape:"):
+                cb.me.remove_effect(e.name)
+                removed = True
+    if s and character().temp_hp == s.get("applied_thp"):
+        character().set_temp_hp(0)
+    clear_state()
+    who = character().name
+    desc = "You return to your true form." if (s or removed) else "You weren't in a Wild Shape form."
+    return f'embed -title "{who} reverts to their true form" -desc "{desc}" {wrap(c)}'
+
+# ---------------------------------------------------------------------
+# checks / saves (merge rule)
+# ---------------------------------------------------------------------
+
+def check(args):
+    c = load_config()
+    s = active_state()
+    name, rest = name_and_rest(args)
+    key = norm_skill(name)
+    if not key:
+        err(f"Unknown skill '{name}'. Try e.g. `!wildshape check stealth`.")
+    char_v = 0
+    try:
+        char_v = int(character().skills[key].value)
+    except:
+        pass
+    final = char_v
+    if s:
+        data = load_form(s["active_slug"])
+        if data and key in data.get("skills", {}):
+            final = max(char_v, int(data["skills"][key]))
+    delta = final - char_v
+    cmd = SKILLS[key]
+    base = f'check "{cmd}"'
+    if delta:
+        base += f' -b {delta}'
+    return base + " " + " ".join([str(x) for x in rest])
+
+def save(args):
+    c = load_config()
+    s = active_state()
+    name, rest = name_and_rest(args)
+    ab = norm_abil(name)
+    if not ab:
+        err(f"Unknown ability '{name}'. Try e.g. `!wildshape save dex`.")
+    rest_str = " ".join([str(x) for x in rest])
+    cv = read_save(character().saves, ab)
+    if cv is None:
+        return f'save {ABBR[ab]} ' + rest_str
+    char_v = cv
+    final = char_v
+    if s:
+        data = load_form(s["active_slug"])
+        if data:
+            final = max(char_v, int(data["saves"].get(ab, char_v)))
+            level = druid_level(c)
+            p = profiles.get(c["subclass"])
+            final += int(profiles.save_mods(p, level, wis_mod(c)).get(ab, 0))
+    delta = final - char_v
+    base = f'save {ABBR[ab]}'
+    if delta:
+        base += f' -b {delta}'
+    return base + " " + rest_str
+
+# ---------------------------------------------------------------------
+# attacks
+# ---------------------------------------------------------------------
+
+def attack(args):
+    c = load_config()
+    s = active_state()
+    if not s:
+        err("You're not in a Wild Shape form. Use `!wildshape <form>` first.")
+    data = load_form(s["active_slug"])
+    level = druid_level(c)
+    p = profiles.get(c["subclass"])
+    name, rest = name_and_rest(args)
+    cb = combat()
+    riders = profiles.attack_riders(p, level, c.get("elemental_fury"))
+    rider_fields = ""
+    for r in riders:
+        rider_fields += f'-f "{r["name"]}|{r["text"]}" '
+    if not data.get("attacks"):
+        return f'embed -title "{data["name"]} Attacks" -desc "No attacks were captured for this form." {wrap(c)}'
+    if not (cb and cb.me):
+        lst = "\n".join([a.get("name", "?") for a in data["attacks"]])
+        return f'embed -title "{data["name"]} Attacks" -desc "{lst}\n\nEnter initiative to roll them (they\'re granted by the Wild Shape effect)." {rider_fields}{wrap(c)}'
+    atkname = best_attack(name, data["attacks"])
+    if not atkname:
+        lst = ", ".join([a.get("name", "?") for a in data["attacks"]])
+        err(f"No attack matches '{name}'. Options: {lst}.")
+    out = f'init attack "{atkname}" ' + " ".join([str(x) for x in rest])
+    if rider_fields:
+        out += " " + rider_fields
+    return out
+
+def best_attack(name, attacks):
+    nl = str(name).lower().strip()
+    if not nl:
+        return attacks[0].get("name") if attacks else None
+    for a in attacks:
+        if a.get("name", "").lower() == nl:
+            return a.get("name")
+    for a in attacks:
+        if nl in a.get("name", "").lower():
+            return a.get("name")
+    return None
+
+# ---------------------------------------------------------------------
+# rest / use economy
+# ---------------------------------------------------------------------
+
+def rest(args):
+    c = load_config()
+    level = druid_level(c)
+    mode = (str(args[0]).lower() if args else "short")
+    ch = character()
+    if not ensure_counter(level):
+        return f'embed -title "Wild Shape" -desc "No Wild Shape uses at your level." {wrap(c)}'
+    before = ch.cc_str(CC_NAME)
+    if mode.startswith("l"):
+        delta = ch.get_cc_max(CC_NAME) - ch.get_cc(CC_NAME)
+        if delta:
+            ch.mod_cc(CC_NAME, delta)
+        verb = "Long Rest, all uses restored"
+    else:
+        if ch.get_cc(CC_NAME) < ch.get_cc_max(CC_NAME):
+            ch.mod_cc(CC_NAME, 1)
+        verb = "Short Rest, regained 1 use"
+    return f'embed -title "Wild Shape ({verb})" -f "Uses|{before} to {ch.cc_str(CC_NAME)}" {wrap(c)}'
+
+def use(args):
+    c = load_config()
+    level = druid_level(c)
+    p = profiles.get(c["subclass"])
+    avail = profiles.alt_uses(p, level)
+    name, rest = name_and_rest(args)
+    if not name:
+        lines = "\n".join([f'`{u["key"]}`: **{u["name"]}**' for u in avail]) or "None available."
+        return f'embed -title "Wild Shape Features" -desc "{lines}\n\nUsage: `!wildshape use <key>`" {wrap(c)}'
+    nl = name.lower()
+    match = None
+    for u in avail:
+        if u["key"] == nl or u["name"].lower() == nl or nl in u["name"].lower():
+            match = u
+            break
+    if not match:
+        lines = ", ".join([u["key"] for u in avail])
+        err(f"No feature matches '{name}'. Available: {lines}.")
+    spent = ""
+    if match.get("cost", 0) > 0:
+        spent = spend_use(level, match["cost"])
+    out = f'embed -title "{character().name}: {match["name"]}" -desc "{match["text"]}" '
+    if spent:
+        out += f'-f "Uses|{spent}|inline" '
+    return out + wrap(c)
+
+# ---------------------------------------------------------------------
+# setup / status / help
+# ---------------------------------------------------------------------
+
+def detect_subclass():
+    markers = {
+        "starry form": "stars", "cosmic omen": "stars", "star map": "stars",
+        "wrath of the sea": "sea", "aquatic affinity": "sea",
+        "circle forms": "moon", "moonlight step": "moon", "lunar": "moon",
+        "land's aid": "land", "nature's ward": "land", "natural recovery": "land",
+    }
+    try:
+        names = [a.name.lower() for a in character().actions]
+        for a in names:
+            for key in markers:
+                if key in a:
+                    return markers[key]
+    except:
+        pass
+    return None
+
+def setup(args):
+    pa = argparse(args)
+    c = load_config()
+    sub = pa.last("subclass")
+    if not sub:
+        detected = detect_subclass()
+        if detected:
+            sub = detected
+    if sub:
+        c["subclass"] = sub.lower()
+    fury = pa.last("fury") or pa.last("elemental_fury")
+    if fury:
+        c["elemental_fury"] = fury.lower()
+    for k in ["color", "image", "thumb"]:
+        v = pa.last(k)
+        if v:
+            c[k] = v
+    save_config(c)
+    level = druid_level(c)
+    has_cc = ensure_counter(level)
+    p = profiles.get(c["subclass"])
+    out = f'embed -title "Wild Shape Setup" '
+    out += f'-f "Class|{p["name"]} (Druid {level})|inline" '
+    out += f'-f "WIS mod|{fmt(wis_mod(c))}|inline" '
+    out += f'-f "Uses Counter|{character().cc_str(CC_NAME) if has_cc else "n/a"}|inline" '
+    if c["subclass"] == "base":
+        out += f'-f "Subclass|Not set. `!wildshape setup -subclass land|moon|sea|stars`" '
+    out += f'-f "Next|In combat: `!wildshape scan <beast>`, then `!wildshape learn`. Then `!wildshape <form>` to transform." '
+    return out + wrap(c)
+
+def status(c):
+    level = druid_level(c)
+    p = profiles.get(c["subclass"])
+    s = active_state()
+    idx = load_index()
+    ch = character()
+    cc = ch.cc_str(CC_NAME) if ch.cc_exists(CC_NAME) else "none"
+    title = "Wild Shape"
+    desc = ""
+    if s:
+        desc = f'**Currently shaped:** {s["name"]}  •  Temp HP applied: {s.get("applied_thp")}\n'
+    desc += f'{p["name"]} • Druid Lv {level} • Uses: {cc} • Known forms: {len(idx)}/{profiles.known_max(level)}'
+    cmds = (
+        "`!wildshape <form>` transform  •  `!wildshape revert` end\n"
+        "`!wildshape forms` list  •  `!wildshape scan <beast>` + `!wildshape learn` add\n"
+        "`!wildshape attack <atk>`  •  `!wildshape check <skill>`  •  `!wildshape save <abil>`\n"
+        "`!wildshape use <feature>`  •  `!wildshape rest short|long`  •  `!wildshape setup`"
+    )
+    hint = subclass_hint(c, level)
+    hint_field = f'-f "Set your subclass|{hint}" ' if hint else ""
+    return f'embed -title "{title}" -desc "{desc}" -f "Commands|{cmds}" {hint_field}{wrap(c)}'
+
+def base(args):
+    c = load_config()
+    if not args:
+        return status(c)
+    first = str(args[0]).lower()
+    if first in ["help", "?", "h"]:
+        return status(c)
+    if first.startswith("-"):
+        return status(c)
+    return transform(args)
+
+# ---------------------------------------------------------------------
+# display helpers
+# ---------------------------------------------------------------------
+
+def subclass_hint(c, level):
+    # Subclass is chosen at level 3 and stored once via setup.
+    if level >= 3 and c["subclass"] == "base":
+        return "No subclass set. Run `!wildshape setup -subclass land|moon|sea|stars`."
+    return ""
+
+def fmt(n):
+    n = int(n)
+    return f"+{n}" if n >= 0 else str(n)
+
+def wrap(c):
+    out = f'-color {c["color"]} '
+    if c.get("thumb"):
+        out += f'-thumb {c["thumb"]} '
+    return out

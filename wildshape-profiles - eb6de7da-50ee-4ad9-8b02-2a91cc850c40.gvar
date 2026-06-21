@@ -1,0 +1,170 @@
+# =====================================================================
+# wildshape-profiles  -  Subclass registry for the Wild Shape collection
+# ---------------------------------------------------------------------
+# Pure DATA + small formula helpers. The engine reads the active profile
+# by subclass. Adding a subclass later = add one entry to PROFILES and,
+# if it changes the form math, a branch in the helpers below. No engine
+# edits required for plain "expend a use" subclasses.
+#
+# Imported by the engine via:  using (profiles = "PROFILES-GVAR-ID")
+# =====================================================================
+
+# ---- static tables (core Wild Shape, all subclasses) ----------------
+
+def uses_max(level):
+    # Wild Shape column of the Druid table
+    if level < 2: return 0
+    if level < 6: return 2
+    if level < 17: return 3
+    return 4
+
+def known_max(level):
+    # Beast Shapes table: Known Forms
+    if level < 2: return 0
+    if level < 4: return 4
+    if level < 8: return 6
+    return 8
+
+def fly_allowed(level):
+    # Base Wild Shape: a form with a Fly Speed only from level 8 (all subclasses)
+    return level >= 8
+
+# ---- challenge rating helpers --------------------------------------
+
+def parse_cr(s):
+    # "1/4" -> 0.25, "1/2" -> 0.5, "1" -> 1.0, "" -> None
+    s = str(s).strip()
+    if not s: return None
+    if "/" in s:
+        a, b = s.split("/", 1)
+        try: return float(a) / float(b)
+        except: return None
+    try: return float(s)
+    except: return None
+
+def format_cr(v):
+    if v is None: return "?"
+    if v == 0.125: return "1/8"
+    if v == 0.25: return "1/4"
+    if v == 0.5: return "1/2"
+    return str(int(v)) if v == int(v) else str(v)
+
+def max_cr(subclass, level):
+    # returns numeric max CR for the subclass at this level
+    if subclass in ("moon", "mutation", "forged"):
+        return float(max(0, floor(level / 3)))
+    # base table
+    if level < 4: return 0.25
+    if level < 8: return 0.5
+    return 1.0
+
+# ---- profile registry ----------------------------------------------
+# Each profile only declares what DIFFERS from base form behaviour plus
+# its list of "expend a use of Wild Shape" alt-features (text reminders).
+
+def alt_base(level):
+    out = []
+    if level >= 2:
+        out.append({"key": "companion", "name": "Wild Companion",
+            "cost": 1, "text": "Cast **Find Familiar** without material components (Fey familiar, lasts until your next Long Rest). You may spend a spell slot instead of a Wild Shape use."})
+    if level >= 5:
+        out.append({"key": "resurgence", "name": "Wild Resurgence",
+            "cost": 0, "text": "Convert a Wild Shape use into a level 1 spell slot (once per Long Rest). If you have no uses left, spend a spell slot to regain one use (no action)."})
+    if level >= 20:
+        out.append({"key": "naturemagician", "name": "Nature Magician (Archdruid)",
+            "cost": 0, "text": "Convert unexpended Wild Shape uses into one spell slot (2 spell levels per use; once per Long Rest)."})
+    return out
+
+def get(subclass):
+    subclass = (subclass or "base").lower()
+    p = {
+        "subclass": subclass,
+        "name": "Druid",
+        "temp_hp_mult": 1,       # temp HP = mult * druid level
+        "ac_floor": None,        # None -> use beast AC; int -> max(floor + WIS, beast AC)
+        "cast_note": "no",       # "no" | "moon" | "beast"
+    }
+    if subclass == "base":
+        p["name"] = "Druid"
+    elif subclass == "land":
+        p["name"] = "Circle of the Land"
+    elif subclass == "moon":
+        p["name"] = "Circle of the Moon"
+        p["temp_hp_mult"] = 3
+        p["ac_floor"] = 13
+        p["cast_note"] = "moon"
+    elif subclass == "sea":
+        p["name"] = "Circle of the Sea"
+    elif subclass == "stars":
+        p["name"] = "Circle of the Stars"
+    return p
+
+def temp_hp(p, level):
+    return p["temp_hp_mult"] * level
+
+def ac_value(p, beast_ac, wis_mod):
+    floor_base = p["ac_floor"]
+    if floor_base is None:
+        return beast_ac
+    return max(floor_base + wis_mod, beast_ac)
+
+def save_mods(p, level, wis_mod):
+    # returns {ability_full_name: flat_bonus} applied on top of the merge rule
+    out = {}
+    if p["subclass"] == "moon" and level >= 6:
+        out["constitution"] = wis_mod      # Increased Toughness
+    return out
+
+def cast_while_shaped(p, level):
+    # (note string, can_cast_bool-ish)
+    if level >= 18:
+        return "You can cast spells in Beast form (Beast Spells), except spells with a costly/consumed material component."
+    if p["cast_note"] == "moon":
+        return "You can't cast spells while shaped, **except** your Circle of the Moon spells."
+    return "You can't cast spells while shaped (Concentration is not broken by shifting)."
+
+def attack_riders(p, level, fury):
+    # list of {name, text, dmg, type_options, once_per_turn}
+    out = []
+    if fury == "primal" and level >= 7:
+        dice = "2d8" if level >= 15 else "1d8"
+        out.append({"name": "Primal Strike", "dmg": dice,
+            "type_options": ["cold", "fire", "lightning", "thunder"], "once_per_turn": True,
+            "text": f"Once per turn, deal an extra {dice} Cold, Fire, Lightning, or Thunder damage on a hit."})
+    if p["subclass"] == "moon":
+        if level >= 6:
+            out.append({"name": "Lunar Radiance", "dmg": None,
+                "type_options": ["radiant"], "once_per_turn": False,
+                "text": "Each Beast-form attack can deal Radiant damage instead of its normal type."})
+        if level >= 14:
+            out.append({"name": "Improved Lunar Radiance", "dmg": "2d10",
+                "type_options": ["radiant"], "once_per_turn": True,
+                "text": "Once per turn, deal an extra 2d10 Radiant damage to a target you hit."})
+    return out
+
+def alt_uses(p, level):
+    sc = p["subclass"]
+    out = alt_base(level)
+    if sc == "land":
+        if level >= 3:
+            la_dice = 2 + (1 if level >= 10 else 0) + (1 if level >= 14 else 0)
+            out.append({"key": "landsaid", "name": "Land's Aid", "cost": 1,
+                "text": f"10-ft-radius Sphere within 60 ft: each chosen creature makes a CON save, taking {la_dice}d6 necrotic (half on success); one creature regains {la_dice}d6 HP. Roll with `!cast` or manually."})
+        if level >= 14:
+            out.append({"key": "sanctuary", "name": "Nature's Sanctuary", "cost": 1,
+                "text": "Create a 15-ft Cube (Half Cover for you and allies; allies gain your Nature's Ward resistance) for 1 minute."})
+    elif sc == "moon":
+        if level >= 10:
+            out.append({"key": "moonlightstep", "name": "Moonlight Step", "cost": 0,
+                "text": "Bonus Action: teleport 30 ft and gain Advantage on your next attack this turn. Uses = WIS mod/Long Rest (tracked by the 'Moonlight Step' counter), or spend a level 2+ slot to restore a use."})
+    elif sc == "sea":
+        if level >= 3:
+            out.append({"key": "wrath", "name": "Wrath of the Sea", "cost": 1,
+                "text": "Bonus Action: manifest a 5-ft (10-ft at L6) ocean-spray Emanation for 10 min. Each turn, a creature in it makes a CON save or takes WIS-mod d6 Cold and is pushed 15 ft."})
+    elif sc == "stars":
+        if level >= 3:
+            out.append({"key": "starryform", "name": "Starry Form", "cost": 1,
+                "text": "Bonus Action: take a luminous Starry Form for 10 min (instead of a Beast). Choose Archer (`!wildshape use archer`), Chalice, or Dragon. Retains your statistics."})
+            out.append({"key": "archer", "name": "Starry Form: Archer", "cost": 0,
+                "text": "Ranged spell attack (60 ft): on hit deals 1d8 (2d8 at L10) + WIS Radiant. Available as a Bonus Action while in Starry Form."})
+    return out
