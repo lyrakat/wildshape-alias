@@ -312,7 +312,7 @@ def learn(args):
         character().delete_cvar("ws_scan_meta")
 
     warn = eligibility_note(c, level, idx, data)
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     crv = profiles.parse_cr(cr)
     crs = profiles.format_cr(crv) if crv is not None else (cr or "?")
     atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
@@ -349,15 +349,21 @@ def forms(args):
     c = load_config()
     level = druid_level(c)
     idx = load_index()
+    pname = profiles.get_profile(c["subclass"])["name"]
     if not idx:
-        return f'embed -title "Known Forms" -desc "You haven\'t learned any forms yet. In combat: `!wildshape scan <beast>` then `!wildshape learn`." -color {c["color"]}'
+        return f'embed -title "Known Forms" -desc "No forms learned yet. In combat: `!wildshape scan <beast>`, then `!wildshape learn`." {wrap(c)}'
     lines = ""
     for f in idx:
         crs = profiles.format_cr(profiles.parse_cr(f["cr"])) if f.get("cr") else "?"
         fly = ", fly" if f.get("fly") else ""
-        lines += f'**{f["name"]}**: CR {crs}{fly}\n'
-    desc = f'Known: {len(idx)} / {profiles.known_max(level)}  |  Max CR: {profiles.format_cr(profiles.max_cr(c["subclass"], level))}  |  Fly: {"yes" if profiles.fly_allowed(level) else "no (L8+)"}'
-    return f'embed -title "Known Forms: {profiles.get(c["subclass"])["name"]} (Lv {level})" -desc "{desc}" -f "Forms|{lines}" -color {c["color"]}'
+        lines += f'**{f["name"]}** (CR {crs}{fly})\n'
+    fly_txt = "Allowed" if profiles.fly_allowed(level) else "From level 8"
+    out = f'embed -title "Known Forms" -desc "{pname}, Druid level {level}" '
+    out += f'-f "Forms|{lines}" '
+    out += f'-f "Known|{len(idx)} / {profiles.known_max(level)}|inline" '
+    out += f'-f "Max CR|{profiles.format_cr(profiles.max_cr(c["subclass"], level))}|inline" '
+    out += f'-f "Fly forms|{fly_txt}|inline" '
+    return out + wrap(c)
 
 def forget(args):
     c = load_config()
@@ -406,7 +412,10 @@ def revert_button():
     return {"label": "Revert", "verb": "reverts to their true form", "style": 4, "automation": auto}
 
 def save_bonus_string(c, data, p, level, wis):
+    # Annotate each per-ability bonus with the form name so its source shows
+    # in the save roll breakdown, e.g. "3[Wolf]|con".
     mods = profiles.save_mods(p, level, wis)
+    label = data["name"]
     segs = []
     for a in ABILITIES:
         cv = read_save(character().saves, a)
@@ -417,7 +426,7 @@ def save_bonus_string(c, data, p, level, wis):
         delta = max(0, beast_v - char_v)
         total = delta + int(mods.get(a, 0))
         if total != 0:
-            segs.append(f"{total}|{ABBR[a]}")
+            segs.append(f"{total}[{label}]|{ABBR[a]}")
     return "+".join(segs)
 
 def apply_overlay(me, c, p, level, data):
@@ -456,7 +465,7 @@ def transform(args):
     data = load_form(f["slug"])
     if not data:
         err(f"Form data for '{f['name']}' is missing. Re-learn it with `!wildshape scan`/`learn`.")
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     spent = spend_use(level, 1)
     thp = profiles.temp_hp(p, level)
     character().set_temp_hp(thp)
@@ -524,15 +533,20 @@ def check(args):
     except:
         pass
     final = char_v
+    beast_v = None
     if s:
         data = load_form(s["active_slug"])
         if data and key in data.get("skills", {}):
-            final = max(char_v, int(data["skills"][key]))
+            beast_v = int(data["skills"][key])
+            final = max(char_v, beast_v)
     delta = final - char_v
     cmd = SKILLS[key]
     base = f'check "{cmd}"'
     if delta:
         base += f' -b {delta}'
+    if s:
+        beast_str = fmt(beast_v) if beast_v is not None else "n/a"
+        base += f' -f "Wild Shape: {s["name"]}|{cmd.title()} {fmt(final)} (you {fmt(char_v)}, beast {beast_str})"'
     return base + " " + " ".join([str(x) for x in rest])
 
 def save(args):
@@ -548,17 +562,27 @@ def save(args):
         return f'save {ABBR[ab]} ' + rest_str
     char_v = cv
     final = char_v
+    beast_v = None
+    moon_bonus = 0
     if s:
         data = load_form(s["active_slug"])
         if data:
-            final = max(char_v, int(data["saves"].get(ab, char_v)))
+            beast_v = int(data["saves"].get(ab, char_v))
+            final = max(char_v, beast_v)
             level = druid_level(c)
-            p = profiles.get(c["subclass"])
-            final += int(profiles.save_mods(p, level, wis_mod(c)).get(ab, 0))
+            p = profiles.get_profile(c["subclass"])
+            moon_bonus = int(profiles.save_mods(p, level, wis_mod(c)).get(ab, 0))
+            final += moon_bonus
     delta = final - char_v
     base = f'save {ABBR[ab]}'
     if delta:
         base += f' -b {delta}'
+    if s:
+        beast_str = fmt(beast_v) if beast_v is not None else "n/a"
+        val = f"{ab.title()} {fmt(final)} (you {fmt(char_v)}, beast {beast_str})"
+        if moon_bonus:
+            val += f", +{moon_bonus} Increased Toughness"
+        base += f' -f "Wild Shape: {s["name"]}|{val}"'
     return base + " " + rest_str
 
 # ---------------------------------------------------------------------
@@ -572,7 +596,7 @@ def attack(args):
         err("You're not in a Wild Shape form. Use `!wildshape <form>` first.")
     data = load_form(s["active_slug"])
     level = druid_level(c)
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     name, rest = name_and_rest(args)
     cb = combat()
     riders = profiles.attack_riders(p, level, c.get("elemental_fury"))
@@ -631,7 +655,7 @@ def rest(args):
 def use(args):
     c = load_config()
     level = druid_level(c)
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     avail = profiles.alt_uses(p, level)
     name, rest = name_and_rest(args)
     if not name:
@@ -695,7 +719,7 @@ def setup(args):
     save_config(c)
     level = druid_level(c)
     has_cc = ensure_counter(level)
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     out = f'embed -title "Wild Shape Setup" '
     out += f'-f "Class|{p["name"]} (Druid {level})|inline" '
     out += f'-f "WIS mod|{fmt(wis_mod(c))}|inline" '
@@ -707,7 +731,7 @@ def setup(args):
 
 def status(c):
     level = druid_level(c)
-    p = profiles.get(c["subclass"])
+    p = profiles.get_profile(c["subclass"])
     s = active_state()
     idx = load_index()
     ch = character()

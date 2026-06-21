@@ -75,7 +75,7 @@ def alt_base(level):
             "cost": 0, "text": "Convert unexpended Wild Shape uses into one spell slot (2 spell levels per use; once per Long Rest)."})
     return out
 
-def get(subclass):
+def get_profile(subclass):
     subclass = (subclass or "base").lower()
     p = {
         "subclass": subclass,
