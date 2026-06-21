@@ -198,11 +198,22 @@ def spend_use(level, n):
     ch = character()
     if not ensure_counter(level):
         return ""
-    cur = ch.get_cc(CC_NAME)
-    if cur < n:
-        return f"Not enough Wild Shape uses ({ch.cc_str(CC_NAME)})."
     ch.mod_cc(CC_NAME, -n)
     return f"**Wild Shape**: {ch.cc_str(CC_NAME)} (-{n})"
+
+def uses_blocked(c, level, n):
+    # Returns a failure embed string if fewer than n Wild Shape uses remain,
+    # else None. Adds a Wild Resurgence note for level 5+ druids.
+    ch = character()
+    ensure_counter(level)
+    have = ch.get_cc(CC_NAME) if ch.cc_exists(CC_NAME) else 0
+    if have >= n:
+        return None
+    cur = ch.cc_str(CC_NAME) if ch.cc_exists(CC_NAME) else "0"
+    out = f'embed -title "No Wild Shape uses" -desc "You have no Wild Shape uses left ({cur})." '
+    if level >= 5:
+        out += f'-f "Wild Resurgence|Spend a spell slot to regain a use: `!wildshape use resurgence` (add `-l <level>` to choose the slot)." '
+    return out + wrap(c)
 
 # ---------------------------------------------------------------------
 # capture (scan + learn)
@@ -466,6 +477,9 @@ def transform(args):
     data = load_form(f["slug"])
     if not data:
         err(f"Form data for '{f['name']}' is missing. Re-learn it with `!wildshape scan`/`learn`.")
+    blocked = uses_blocked(c, level, 1)
+    if blocked:
+        return blocked
     p = profiles.get_profile(c["subclass"])
     spent = spend_use(level, 1)
     # Temp HP does not stack: keep the higher of your current temp HP and the
@@ -726,9 +740,13 @@ def use(args):
         err(f"No feature matches '{name}'. Available: {lines}.")
     if match["key"] == "resurgence":
         return wild_resurgence(c, level, args)
+    cost = match.get("cost", 0)
     spent = ""
-    if match.get("cost", 0) > 0:
-        spent = spend_use(level, match["cost"])
+    if cost > 0:
+        blocked = uses_blocked(c, level, cost)
+        if blocked:
+            return blocked
+        spent = spend_use(level, cost)
     out = f'embed -title "{character().name}: {match["name"]}" -desc "{match["text"]}" '
     if spent:
         out += f'-f "Uses|{spent}|inline" '
