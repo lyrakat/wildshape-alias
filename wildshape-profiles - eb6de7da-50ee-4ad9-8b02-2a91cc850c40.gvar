@@ -69,7 +69,7 @@ def alt_base(level):
             "cost": 1, "text": "Cast **Find Familiar** without material components (Fey familiar, lasts until your next Long Rest). You may spend a spell slot instead of a Wild Shape use."})
     if level >= 5:
         out.append({"key": "resurgence", "name": "Wild Resurgence",
-            "cost": 0, "text": "Convert a Wild Shape use into a level 1 spell slot (once per Long Rest). If you have no uses left, spend a spell slot to regain one use (no action)."})
+            "cost": 0, "text": "With no uses left, spend a spell slot to regain one Wild Shape use: `!wildshape use resurgence` (add `-l <level>` to pick the slot). Or spend a use to regain a level 1 slot once per Long Rest: `!wildshape use resurgence -slot`."})
     if level >= 20:
         out.append({"key": "naturemagician", "name": "Nature Magician (Archdruid)",
             "cost": 0, "text": "Convert unexpended Wild Shape uses into one spell slot (2 spell levels per use; once per Long Rest)."})

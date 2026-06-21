@@ -404,9 +404,10 @@ def swap(args):
 # ---------------------------------------------------------------------
 
 def revert_button():
+    # Ends the form only. Temp HP is left in place (it lasts until depleted or a
+    # Long Rest under the 2024 rules), so no temphp step here.
     auto = [
         {"type": "remove_ieffect"},
-        {"type": "target", "target": "self", "effects": [{"type": "temphp", "amount": "0"}]},
         {"type": "text", "text": "You shift back to your true form."},
     ]
     return {"label": "Revert", "verb": "reverts to their true form", "style": 4, "automation": auto}
@@ -467,23 +468,29 @@ def transform(args):
         err(f"Form data for '{f['name']}' is missing. Re-learn it with `!wildshape scan`/`learn`.")
     p = profiles.get_profile(c["subclass"])
     spent = spend_use(level, 1)
-    thp = profiles.temp_hp(p, level)
-    character().set_temp_hp(thp)
+    # Temp HP does not stack: keep the higher of your current temp HP and the
+    # amount Wild Shape grants (never lower an existing pool).
+    grant = profiles.temp_hp(p, level)
+    cur_thp = character().temp_hp
+    if grant > cur_thp:
+        character().set_temp_hp(grant)
+    final_thp = max(cur_thp, grant)
     cb = combat()
     in_combat = bool(cb and cb.me)
     if in_combat:
         apply_overlay(cb.me, c, p, level, data)
-    save_state({"active_slug": f["slug"], "name": data["name"], "applied_thp": thp, "level_at": level})
-    return transform_embed(c, p, level, data, thp, spent, in_combat)
+    save_state({"active_slug": f["slug"], "name": data["name"], "applied_thp": final_thp, "level_at": level})
+    return transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat)
 
-def transform_embed(c, p, level, data, thp, spent, in_combat):
+def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat):
     wis = wis_mod(c)
     name = character().name
     phys = f'STR {fmt(data["stats"]["strength"]["mod"])} • DEX {fmt(data["stats"]["dexterity"]["mod"])} • CON {fmt(data["stats"]["constitution"]["mod"])}'
     ac = profiles.ac_value(p, data["ac"], wis) if data["ac"] is not None else "?"
     atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
+    thp_str = str(final_thp) if grant > cur_thp else f"{final_thp} (kept; form grants {grant})"
     out = f'embed -title "{name} Wild Shapes into a {data["name"]}" '
-    out += f'-f "Temp HP|{thp}|inline" '
+    out += f'-f "Temp HP|{thp_str}|inline" '
     out += f'-f "AC|{ac}|inline" '
     out += f'-f "Type|{data["creature_type"] or "Beast"}|inline" '
     out += f'-f "Beast Stats|{phys}" '
@@ -509,11 +516,9 @@ def revert(args):
             if e.name.startswith("Wild Shape:"):
                 cb.me.remove_effect(e.name)
                 removed = True
-    if s and character().temp_hp == s.get("applied_thp"):
-        character().set_temp_hp(0)
     clear_state()
     who = character().name
-    desc = "You return to your true form." if (s or removed) else "You weren't in a Wild Shape form."
+    desc = "You return to your true form. Temp HP remains until spent or a Long Rest." if (s or removed) else "You weren't in a Wild Shape form."
     return f'embed -title "{who} reverts to their true form" -desc "{desc}" {wrap(c)}'
 
 # ---------------------------------------------------------------------
@@ -652,6 +657,55 @@ def rest(args):
         verb = "Short Rest, regained 1 use"
     return f'embed -title "Wild Shape ({verb})" -f "Uses|{before} to {ch.cc_str(CC_NAME)}" {wrap(c)}'
 
+def lowest_slot_level(sb):
+    for l in range(1, 10):
+        if sb.get_max_slots(l) > 0 and sb.get_slots(l) > 0:
+            return l
+    return None
+
+def wild_resurgence(c, level, args):
+    # Level 5 Wild Resurgence. Two directions:
+    #   default:  spend a spell slot to regain one Wild Shape use (only at 0 uses)
+    #   -slot:    spend a Wild Shape use to regain a level 1 slot (once per Long Rest)
+    ch = character()
+    sb = ch.spellbook
+    pa = argparse(args)
+    ensure_counter(level)
+    if ("-slot" in args) or ("slot" in args):
+        ch.create_cc_nx("Wild Resurgence", minVal=0, maxVal=1, reset="long", dispType="bubble",
+            title="Wild Resurgence",
+            desc="Once per Long Rest: spend a Wild Shape use to regain a level 1 spell slot.")
+        if ch.get_cc("Wild Resurgence") < 1:
+            err("You have already used Wild Resurgence to make a spell slot since your last Long Rest.")
+        if ch.get_cc(CC_NAME) < 1:
+            err("You have no Wild Shape uses to spend.")
+        if sb.get_slots(1) >= sb.get_max_slots(1):
+            err("Your level 1 spell slots are already full.")
+        ch.mod_cc(CC_NAME, -1)
+        ch.mod_cc("Wild Resurgence", -1)
+        sb.set_slots(1, sb.get_slots(1) + 1)
+        out = f'embed -title "{ch.name}: Wild Resurgence" -desc "Spent a Wild Shape use to regain a level 1 spell slot (no action)." '
+        out += f'-f "Wild Shape|{ch.cc_str(CC_NAME)} (-1)|inline" '
+        out += f'-f "Level 1 Slots|{sb.slots_str(1)} (+1)|inline" '
+        return out + wrap(c)
+    if ch.get_cc(CC_NAME) > 0:
+        err("Wild Resurgence (slot to use) works only when you have no Wild Shape uses left.")
+    lvl = pa.last("l")
+    if lvl:
+        lvl = int(lvl)
+        if sb.get_slots(lvl) < 1:
+            err(f"You have no level {lvl} spell slots available.")
+    else:
+        lvl = lowest_slot_level(sb)
+        if lvl is None:
+            err("You have no spell slots available to spend.")
+    sb.set_slots(lvl, sb.get_slots(lvl) - 1)
+    ch.mod_cc(CC_NAME, 1)
+    out = f'embed -title "{ch.name}: Wild Resurgence" -desc "Spent a level {lvl} spell slot to regain a Wild Shape use (once per turn, no action)." '
+    out += f'-f "Wild Shape|{ch.cc_str(CC_NAME)} (+1)|inline" '
+    out += f'-f "Level {lvl} Slots|{sb.slots_str(lvl)} (-1)|inline" '
+    return out + wrap(c)
+
 def use(args):
     c = load_config()
     level = druid_level(c)
@@ -670,6 +724,8 @@ def use(args):
     if not match:
         lines = ", ".join([u["key"] for u in avail])
         err(f"No feature matches '{name}'. Available: {lines}.")
+    if match["key"] == "resurgence":
+        return wild_resurgence(c, level, args)
     spent = ""
     if match.get("cost", 0) > 0:
         spent = spend_use(level, match["cost"])
