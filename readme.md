@@ -39,6 +39,10 @@ Forms are read from Avrae's compendium while in initiative, then stored on your 
 - Skill checks while shaped use `!wildshape check`; in combat the effect adjusts automated saves directly.
 - Duration, the Incapacitated end condition, spellcasting, and equipment are shown as reminders.
 
+## Issues
+Report bugs, problems, or missing and incomplete features at
+https://github.com/lyrakat/wildshape-alias/issues
+
 ## Editing
 Two GVARs hold the code:
 - `wildshape-engine`: `555fd5a3-216e-4ba5-8847-43db73c03c0f`
