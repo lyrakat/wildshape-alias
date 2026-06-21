@@ -45,3 +45,6 @@ Two GVARs hold the code:
 - `wildshape-profiles`: `eb6de7da-50ee-4ad9-8b02-2a91cc850c40`
 
 Sync with Push Update (local to workshop). Get Collection overwrites local files with the workshop copies.
+
+## Development
+Parts of this code were written with AI assistance (Claude), reviewed and maintained by the repository owner.
