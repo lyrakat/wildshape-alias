@@ -30,6 +30,16 @@ SKILLS = {
     "performance": "performance", "persuasion": "persuasion", "religion": "religion",
     "sleightOfHand": "sleight of hand", "stealth": "stealth", "survival": "survival",
 }
+SKILL_ABILITY = {
+    "acrobatics": "dexterity", "animalHandling": "wisdom", "arcana": "intelligence",
+    "athletics": "strength", "deception": "charisma", "history": "intelligence",
+    "insight": "wisdom", "intimidation": "charisma", "investigation": "intelligence",
+    "medicine": "wisdom", "nature": "intelligence", "perception": "wisdom",
+    "performance": "charisma", "persuasion": "charisma", "religion": "intelligence",
+    "sleightOfHand": "dexterity", "stealth": "dexterity", "survival": "wisdom",
+}
+# Abilities replaced by the Beast's stat block in Wild Shape (you keep INT/WIS/CHA).
+PHYS = ["strength", "dexterity", "constitution"]
 
 # ---------------------------------------------------------------------
 # small utilities
@@ -87,6 +97,40 @@ def norm_abil(s):
         if f == t or ABBR[f] == t or (len(t) >= 3 and f.startswith(t)):
             return f
     return None
+
+def save_prof(ab):
+    # Your proficiency multiplier (0/0.5/1/2) for a save; 1 on failure so the
+    # gained-proficiency top-up is skipped rather than misfiring.
+    for k in [ABBR[ab], ab]:
+        try:
+            return character().saves.get(k).prof
+        except:
+            pass
+    return 1
+
+def beastform_value(data, ability, char_v, beast_listed, your_prof):
+    # Your skill/save modifier while shaped, per the 2024 Wild Shape merge rule.
+    # STR/DEX/CON are replaced by the Beast's scores, so swap your ability mod
+    # for the Beast's; INT/WIS/CHA are retained, so keep yours. Your Proficiency
+    # Bonus and other bonuses already in char_v (feats, items, expertise) carry
+    # over. If the Beast is proficient in this skill/save (its stat-block value
+    # beats its bare ability mod) and you are not (or only half), you gain its
+    # proficiency: top up to a full proficiency using YOUR PB. The result can be
+    # lower than your true form when the Beast is physically weaker.
+    out = char_v
+    try:
+        beast_mod = int(data["stats"][ability]["mod"])
+    except:
+        beast_mod = None
+    if ability in PHYS and beast_mod is not None:
+        try:
+            out = char_v - int(character().stats.get_mod(ability)) + beast_mod
+        except:
+            out = char_v
+    if beast_listed is not None and beast_mod is not None and your_prof < 1 and int(beast_listed) > beast_mod:
+        pb = int(character().stats.prof_bonus)
+        out = out + pb - int(pb * your_prof)
+    return out
 
 # ---------------------------------------------------------------------
 # persistent state (per-character cvars)
@@ -424,8 +468,13 @@ def revert_button():
     return {"label": "Revert", "verb": "reverts to their true form", "style": 4, "automation": auto}
 
 def save_bonus_string(c, data, p, level, wis):
-    # Annotate each per-ability bonus with the form name so its source shows
-    # in the save roll breakdown, e.g. "3[Wolf]|con".
+    # Per-ability save bonus for the init overlay, so a plain !save while shaped
+    # reflects the form. For each ability: your beast-form save (physical
+    # abilities swap to the Beast's mod, mental keep yours), raised to the
+    # stat-block value if higher, plus any subclass mod (e.g. Moon's Increased
+    # Toughness). Each segment is annotated with the form name so its source
+    # shows in the roll breakdown, e.g. "3[Wolf]|con". The delta vs your true
+    # form can be negative when the Beast is physically weaker (true RAW).
     mods = profiles.save_mods(p, level, wis)
     label = data["name"]
     segs = []
@@ -435,8 +484,8 @@ def save_bonus_string(c, data, p, level, wis):
             continue
         char_v = cv
         beast_v = int(data["saves"].get(a, char_v))
-        delta = max(0, beast_v - char_v)
-        total = delta + int(mods.get(a, 0))
+        yours = beastform_value(data, a, char_v, beast_v, save_prof(a))
+        total = (max(yours, beast_v) - char_v) + int(mods.get(a, 0))
         if total != 0:
             segs.append(f"{total}[{label}]|{ABBR[a]}")
     return "+".join(segs)
@@ -552,12 +601,22 @@ def check(args):
     except:
         pass
     final = char_v
+    yours = char_v
     beast_v = None
     if s:
         data = load_form(s["active_slug"])
-        if data and key in data.get("skills", {}):
-            beast_v = int(data["skills"][key])
-            final = max(char_v, beast_v)
+        if data:
+            # Beast form merge: physical skills use the Beast's ability mod with
+            # your retained proficiency; you also gain the Beast's proficiencies
+            # (using your PB); then use the stat-block value if it's higher.
+            beast_v = int(data["skills"][key]) if key in data.get("skills", {}) else None
+            your_prof = 1
+            try:
+                your_prof = character().skills[key].prof
+            except:
+                your_prof = 1
+            yours = beastform_value(data, SKILL_ABILITY.get(key), char_v, beast_v, your_prof)
+            final = yours if beast_v is None else max(yours, beast_v)
     delta = final - char_v
     cmd = SKILLS[key]
     base = f'check "{cmd}"'
@@ -565,7 +624,7 @@ def check(args):
         base += f' -b {delta}'
     if s:
         beast_str = fmt(beast_v) if beast_v is not None else "n/a"
-        base += f' -f "Wild Shape: {s["name"]}|{cmd.title()} {fmt(final)} (you {fmt(char_v)}, beast {beast_str})"'
+        base += f' -f "Wild Shape: {s["name"]}|{cmd.title()} {fmt(final)} (you {fmt(yours)}, beast {beast_str})"'
     return base + " " + " ".join([str(x) for x in rest])
 
 def save(args):
@@ -581,26 +640,41 @@ def save(args):
         return f'save {ABBR[ab]} ' + rest_str
     char_v = cv
     final = char_v
+    yours = char_v
     beast_v = None
     moon_bonus = 0
+    overlay_active = False
     if s:
         data = load_form(s["active_slug"])
         if data:
+            # Beast form merge: physical saves use the Beast's ability mod with
+            # your retained proficiency; you also gain the Beast's proficiencies
+            # (using your PB); then use the stat-block value if higher, plus any
+            # subclass mod (Moon: Increased Toughness).
             beast_v = int(data["saves"].get(ab, char_v))
-            final = max(char_v, beast_v)
+            yours = beastform_value(data, ab, char_v, beast_v, save_prof(ab))
+            final = max(yours, beast_v)
             level = druid_level(c)
             p = profiles.get_profile(c["subclass"])
             moon_bonus = int(profiles.save_mods(p, level, wis_mod(c)).get(ab, 0))
             final += moon_bonus
+        # In combat the Wild Shape effect already adds this bonus to a plain
+        # !save via its save_bonus overlay, so applying -b here too would double
+        # it. Skip the adjustment when the effect is on us.
+        cb = combat()
+        if cb and cb.me and cb.me.get_effect(effect_name(s["name"])):
+            overlay_active = True
     delta = final - char_v
     base = f'save {ABBR[ab]}'
-    if delta:
+    if delta and not overlay_active:
         base += f' -b {delta}'
     if s:
         beast_str = fmt(beast_v) if beast_v is not None else "n/a"
-        val = f"{ab.title()} {fmt(final)} (you {fmt(char_v)}, beast {beast_str})"
+        val = f"{ab.title()} {fmt(final)} (you {fmt(yours)}, beast {beast_str})"
         if moon_bonus:
             val += f", +{moon_bonus} Increased Toughness"
+        if overlay_active:
+            val += " (applied by the Wild Shape effect)"
         base += f' -f "Wild Shape: {s["name"]}|{val}"'
     return base + " " + rest_str
 
