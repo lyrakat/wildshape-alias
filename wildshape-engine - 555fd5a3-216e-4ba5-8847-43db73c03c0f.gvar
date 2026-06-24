@@ -549,6 +549,15 @@ def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_comb
     wis = wis_mod(c)
     name = character().name
     phys = f'STR {fmt(data["stats"]["strength"]["mod"])} • DEX {fmt(data["stats"]["dexterity"]["mod"])} • CON {fmt(data["stats"]["constitution"]["mod"])}'
+    # How much your STR/DEX mod shifts in this form. The init effect can't retarget
+    # the ability mod on your own sheet attacks (no ability-scoped attack/damage
+    # bonus exists), so we surface the delta to apply by hand to attacks you keep.
+    your_str = int(character().stats.get_mod("strength"))
+    your_dex = int(character().stats.get_mod("dexterity"))
+    beast_str = int(data["stats"]["strength"]["mod"])
+    beast_dex = int(data["stats"]["dexterity"]["mod"])
+    dstr = beast_str - your_str
+    ddex = beast_dex - your_dex
     ac = profiles.ac_value(p, data["ac"], wis) if data["ac"] is not None else "?"
     atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
     thp_str = str(final_thp) if grant > cur_thp else f"{final_thp} (kept; form grants {grant})"
@@ -558,6 +567,14 @@ def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_comb
     out += f'-f "Type|{data["creature_type"] or "Beast"}|inline" '
     out += f'-f "Beast Stats|{phys}" '
     out += f'-f "Attacks|{atk_names}" '
+    own_parts = []
+    if dstr:
+        own_parts.append(f"STR {fmt(dstr)}")
+    if ddex:
+        own_parts.append(f"DEX {fmt(ddex)}")
+    if own_parts:
+        own = ", ".join(own_parts)
+        out += f'-f "Your own attacks|{own} to hit and damage. Apply this to attacks you keep from your own features, such as unarmed strikes; attacks the beast grants already use its stats." '
     out += f'-f "Reminder|{profiles.cast_while_shaped(p, level)}\nRetained: HP, Hit Dice, INT/WIS/CHA, class features, feats. Revert as a Bonus Action." '
     if spent:
         out += f'-f "Uses|{spent}|inline" '
