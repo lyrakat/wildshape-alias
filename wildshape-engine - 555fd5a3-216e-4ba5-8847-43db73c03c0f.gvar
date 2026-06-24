@@ -417,7 +417,7 @@ def forms(args):
     out += f'-f "Forms|{lines}" '
     out += f'-f "Known|{len(idx)} / {profiles.known_max(level)}|inline" '
     out += f'-f "Max CR|{profiles.format_cr(profiles.max_cr(c["subclass"], level))}|inline" '
-    out += f'-f "Fly forms|{fly_txt}|inline" '
+    out += f'-f "Fly Forms|{fly_txt}|inline" '
     return out + wrap(c)
 
 def forget(args):
@@ -574,15 +574,15 @@ def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_comb
         own_parts.append(f"DEX {fmt(ddex)}")
     if own_parts:
         own = ", ".join(own_parts)
-        out += f'-f "Your own attacks|{own} to hit and damage. Apply this to attacks you keep from your own features, such as unarmed strikes; attacks the beast grants already use its stats." '
+        out += f'-f "Your Own Attacks|{own} to hit and damage. Apply this to attacks you keep from your own features, such as unarmed strikes; attacks the beast grants already use its stats." '
     out += f'-f "Reminder|{profiles.cast_while_shaped(p, level)}\nRetained: HP, Hit Dice, INT/WIS/CHA, class features, feats. Revert as a Bonus Action." '
     if spent:
         out += f'-f "Uses|{spent}|inline" '
     if not in_combat:
-        out += f'-f "Out of combat|Temp HP applied. Use in initiative to apply AC, resistances, saves, and attacks." '
+        out += f'-f "Out of Combat|Temp HP applied. Use in initiative to apply AC, resistances, saves, and attacks." '
     hint = subclass_hint(c, level)
     if hint:
-        out += f'-f "Set your subclass|{hint}" '
+        out += f'-f "Set Your Subclass|{hint}" '
     out += wrap(c)
     return out
 
@@ -641,7 +641,7 @@ def check(args):
         base += f' -b {delta}'
     if s:
         beast_str = fmt(beast_v) if beast_v is not None else "n/a"
-        base += f' -f "Wild Shape: {s["name"]}|{cmd.title()} {fmt(final)} (you {fmt(yours)}, beast {beast_str})"'
+        base += f' -f "Wild Shape: {s["name"]}|{cmd.title()} {fmt(final)} (Normal {fmt(char_v)}, Shaped {fmt(yours)}, Stat Block {beast_str})"'
     return base + " " + " ".join([str(x) for x in rest])
 
 def save(args):
@@ -687,7 +687,7 @@ def save(args):
         base += f' -b {delta}'
     if s:
         beast_str = fmt(beast_v) if beast_v is not None else "n/a"
-        val = f"{ab.title()} {fmt(final)} (you {fmt(yours)}, beast {beast_str})"
+        val = f"{ab.title()} {fmt(final)} (Normal {fmt(char_v)}, Shaped {fmt(yours)}, Stat Block {beast_str})"
         if moon_bonus:
             val += f", +{moon_bonus} Increased Toughness"
         if overlay_active:
@@ -887,7 +887,7 @@ def setup(args):
     p = profiles.get_profile(c["subclass"])
     out = f'embed -title "Wild Shape Setup" '
     out += f'-f "Class|{p["name"]} (Druid {level})|inline" '
-    out += f'-f "WIS mod|{fmt(wis_mod(c))}|inline" '
+    out += f'-f "WIS Mod|{fmt(wis_mod(c))}|inline" '
     out += f'-f "Uses Counter|{character().cc_str(CC_NAME) if has_cc else "n/a"}|inline" '
     if c["subclass"] == "base":
         out += f'-f "Subclass|Not set. `!wildshape setup -subclass land|moon|sea|stars`" '
@@ -913,7 +913,7 @@ def status(c):
         "`!wildshape use <feature>`  •  `!wildshape rest short|long`  •  `!wildshape setup`"
     )
     hint = subclass_hint(c, level)
-    hint_field = f'-f "Set your subclass|{hint}" ' if hint else ""
+    hint_field = f'-f "Set Your Subclass|{hint}" ' if hint else ""
     return f'embed -title "{title}" -desc "{desc}" -f "Commands|{cmds}" {hint_field}{wrap(c)}'
 
 def base(args):
