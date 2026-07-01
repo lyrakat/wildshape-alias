@@ -153,7 +153,7 @@ def save_config(c):
 def druid_level(c):
     if c.get("level_override"):
         return int(c["level_override"])
-    return int(character().levels.get("Druid") or 0)
+    return class_level("Druid")
 
 def wis_mod(c):
     if c.get("wis_override") is not None:
@@ -522,6 +522,23 @@ def unarmored_ac(formula, data, c):
             total += ability_mod_in_form(ab, data, c)
     return total
 
+def class_level(name):
+    # Case-insensitive class level lookup; sheets vary in how a class is cased.
+    # Falls back to the direct .get if levels can't be iterated.
+    nl = str(name).lower()
+    try:
+        for cls, lvl in character().levels:
+            if str(cls).lower() == nl:
+                return int(lvl)
+        return 0
+    except:
+        pass
+    try:
+        v = character().levels.get(name)
+        return int(v) if v else 0
+    except:
+        return 0
+
 def compute_ac(c, p, data, rest):
     # Best-armor rule: while shaped your AC is the highest of every applicable
     # calculation, compared in one final step (so a Monk/Barbarian/Moon multiclass
@@ -543,9 +560,9 @@ def compute_ac(c, p, data, rest):
         cands.append(("Beast", int(data["ac"])))
     if p.get("ac_floor") is not None:
         cands.append((p["name"], int(p["ac_floor"]) + wis))
-    if int(character().levels.get("Monk") or 0) >= 1:
+    if class_level("Monk") >= 1:
         cands.append(("Monk Unarmored Defense", unarmored_ac("10+wis+dex", data, c)))
-    if int(character().levels.get("Barbarian") or 0) >= 1:
+    if class_level("Barbarian") >= 1:
         cands.append(("Barbarian Unarmored Defense", unarmored_ac("10+con+dex", data, c)))
     if c.get("unarmored"):
         v = unarmored_ac(c["unarmored"], data, c)
