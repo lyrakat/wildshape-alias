@@ -81,7 +81,7 @@ def get_profile(subclass):
         "subclass": subclass,
         "name": "Druid",
         "temp_hp_mult": 1,       # temp HP = mult * druid level
-        "ac_floor": None,        # None -> use beast AC; int -> max(floor + WIS, beast AC)
+        "ac_floor": None,        # int -> subclass AC of floor + WIS enters the engine's best-armor comparison (e.g. Moon 13)
         "cast_note": "no",       # "no" | "moon" | "beast"
     }
     if subclass == "base":
@@ -101,12 +101,6 @@ def get_profile(subclass):
 
 def temp_hp(p, level):
     return p["temp_hp_mult"] * level
-
-def ac_value(p, beast_ac, wis_mod):
-    floor_base = p["ac_floor"]
-    if floor_base is None:
-        return beast_ac
-    return max(floor_base + wis_mod, beast_ac)
 
 def save_mods(p, level, wis_mod):
     # returns {ability_full_name: flat_bonus} applied on top of the merge rule

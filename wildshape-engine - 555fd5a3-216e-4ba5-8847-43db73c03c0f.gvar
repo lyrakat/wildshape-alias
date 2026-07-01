@@ -56,7 +56,7 @@ def slugify(s):
 def positional(args):
     # tokens that are not flags or flag-values
     out = []
-    flag_vals = ["cr", "as", "size", "b", "t", "subclass", "fury", "color", "image", "thumb", "rider", "l"]
+    flag_vals = ["cr", "as", "size", "b", "t", "subclass", "fury", "unarmored", "ac", "color", "image", "thumb", "rider", "l"]
     i = 0
     while i < len(args):
         a = str(args[i])
@@ -141,6 +141,7 @@ def load_config():
     c = load_json(raw) if raw else {}
     if "subclass" not in c: c["subclass"] = "base"
     if "elemental_fury" not in c: c["elemental_fury"] = None
+    if "unarmored" not in c: c["unarmored"] = None
     if "color" not in c: c["color"] = "#3b7a57"
     if "thumb" not in c: c["thumb"] = None
     if "image" not in c: c["image"] = None
@@ -490,14 +491,83 @@ def save_bonus_string(c, data, p, level, wis):
             segs.append(f"{total}[{label}]|{ABBR[a]}")
     return "+".join(segs)
 
-def apply_overlay(me, c, p, level, data):
+def ability_mod_in_form(ab, data, c):
+    # In-form modifier for an ability: physical abilities (STR/DEX/CON) come from
+    # the Beast; mental abilities (INT/WIS/CHA) stay yours. WIS honors overrides.
+    if ab in PHYS:
+        try:
+            return int(data["stats"][ab]["mod"])
+        except:
+            return 0
+    if ab == "wisdom":
+        return wis_mod(c)
+    try:
+        return int(character().stats.get_mod(ab))
+    except:
+        return 0
+
+def unarmored_ac(formula, data, c):
+    # Evaluate an Unarmored Defense formula like "10+wis+dex": the first token is the
+    # integer base and each later token is an ability whose in-form mod is added. Serves
+    # the Monk preset ("10+wis+dex"), the Barbarian preset ("10+con+dex"), and any
+    # manually declared formula. Returns None if the base can't be parsed.
+    toks = str(formula).lower().replace(" ", "").split("+")
+    try:
+        total = int(toks[0])
+    except:
+        return None
+    for t in toks[1:]:
+        ab = norm_abil(t)
+        if ab is not None:
+            total += ability_mod_in_form(ab, data, c)
+    return total
+
+def compute_ac(c, p, data, rest):
+    # Best-armor rule: while shaped your AC is the highest of every applicable
+    # calculation, compared in one final step (so a Monk/Barbarian/Moon multiclass
+    # resolves correctly with no special-casing). Returns (ac, label); an ac of None
+    # means set no AC on the effect, leaving your sheet AC in place. Per-transform
+    # flags: -ac <n> forces a static value, -noac applies no override.
+    pa = argparse(rest)
+    ov = pa.last("ac")
+    if ov is not None:
+        try:
+            return int(ov), "set"
+        except:
+            pass
+    if ("-noac" in rest) or ("noac" in rest):
+        return None, "sheet"
+    wis = wis_mod(c)
+    cands = []
+    if data.get("ac") is not None:
+        cands.append(("Beast", int(data["ac"])))
+    if p.get("ac_floor") is not None:
+        cands.append((p["name"], int(p["ac_floor"]) + wis))
+    if int(character().levels.get("Monk") or 0) >= 1:
+        cands.append(("Monk Unarmored Defense", unarmored_ac("10+wis+dex", data, c)))
+    if int(character().levels.get("Barbarian") or 0) >= 1:
+        cands.append(("Barbarian Unarmored Defense", unarmored_ac("10+con+dex", data, c)))
+    if c.get("unarmored"):
+        v = unarmored_ac(c["unarmored"], data, c)
+        if v is not None:
+            cands.append(("Unarmored Defense", v))
+    cands = [x for x in cands if x[1] is not None]
+    if not cands:
+        return None, "?"
+    best = cands[0]
+    for x in cands[1:]:
+        if x[1] > best[1]:
+            best = x
+    return best[1], best[0]
+
+def apply_overlay(me, c, p, level, data, ac):
     wis = wis_mod(c)
     for e in me.effects:
         if e.name.startswith("Wild Shape:"):
             me.remove_effect(e.name)
     passive = {}
-    if data["ac"] is not None:
-        passive["ac_value"] = profiles.ac_value(p, data["ac"], wis)
+    if ac is not None:
+        passive["ac_value"] = ac
     if data["resist"]["resist"]:
         passive["resistances"] = data["resist"]["resist"]
     if data["resist"]["immune"]:
@@ -530,6 +600,7 @@ def transform(args):
     if blocked:
         return blocked
     p = profiles.get_profile(c["subclass"])
+    ac, ac_label = compute_ac(c, p, data, rest)
     spent = spend_use(level, 1)
     # Temp HP does not stack: keep the higher of your current temp HP and the
     # amount Wild Shape grants (never lower an existing pool).
@@ -541,12 +612,11 @@ def transform(args):
     cb = combat()
     in_combat = bool(cb and cb.me)
     if in_combat:
-        apply_overlay(cb.me, c, p, level, data)
+        apply_overlay(cb.me, c, p, level, data, ac)
     save_state({"active_slug": f["slug"], "name": data["name"], "applied_thp": final_thp, "level_at": level})
-    return transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat)
+    return transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat, ac, ac_label)
 
-def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat):
-    wis = wis_mod(c)
+def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_combat, ac, ac_label):
     name = character().name
     phys = f'STR {fmt(data["stats"]["strength"]["mod"])} • DEX {fmt(data["stats"]["dexterity"]["mod"])} • CON {fmt(data["stats"]["constitution"]["mod"])}'
     # How much your STR/DEX mod shifts in this form. The init effect can't retarget
@@ -558,12 +628,17 @@ def transform_embed(c, p, level, data, grant, final_thp, cur_thp, spent, in_comb
     beast_dex = int(data["stats"]["dexterity"]["mod"])
     dstr = beast_str - your_str
     ddex = beast_dex - your_dex
-    ac = profiles.ac_value(p, data["ac"], wis) if data["ac"] is not None else "?"
+    if ac is None:
+        ac_disp = "Unchanged (your sheet AC)" if ac_label == "sheet" else "?"
+    elif ac_label == "Beast":
+        ac_disp = str(ac)
+    else:
+        ac_disp = f"{ac} ({ac_label})"
     atk_names = ", ".join([a.get("name", "?") for a in data["attacks"]]) or "none"
     thp_str = str(final_thp) if grant > cur_thp else f"{final_thp} (kept; form grants {grant})"
     out = f'embed -title "{name} Wild Shapes into a {data["name"]}" '
     out += f'-f "Temp HP|{thp_str}|inline" '
-    out += f'-f "AC|{ac}|inline" '
+    out += f'-f "AC|{ac_disp}|inline" '
     out += f'-f "Type|{data["creature_type"] or "Beast"}|inline" '
     out += f'-f "Beast Stats|{phys}" '
     out += f'-f "Attacks|{atk_names}" '
@@ -877,6 +952,14 @@ def setup(args):
     fury = pa.last("fury") or pa.last("elemental_fury")
     if fury:
         c["elemental_fury"] = fury.lower()
+    un = pa.last("unarmored")
+    if un is not None:
+        # Declare an Unarmored Defense formula for AC calculations not auto-detected
+        # (Monk and Barbarian are automatic). "none"/"off"/"clear"/"-" clears it.
+        if un.lower() in ["none", "off", "clear", "-"]:
+            c["unarmored"] = None
+        else:
+            c["unarmored"] = un
     for k in ["color", "image", "thumb"]:
         v = pa.last(k)
         if v:
@@ -891,6 +974,8 @@ def setup(args):
     out += f'-f "Uses Counter|{character().cc_str(CC_NAME) if has_cc else "n/a"}|inline" '
     if c["subclass"] == "base":
         out += f'-f "Subclass|Not set. `!wildshape setup -subclass land|moon|sea|stars`" '
+    if c.get("unarmored"):
+        out += f'-f "Unarmored Defense|`{c["unarmored"]}` (Monk and Barbarian are detected automatically). Clear with `-unarmored none`.|inline" '
     out += f'-f "Next|In combat: `!wildshape scan <beast>`, then `!wildshape learn`. Then `!wildshape <form>` to transform." '
     return out + wrap(c)
 

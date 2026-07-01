@@ -4,8 +4,10 @@ Wild Shape for 2024 Druids: the core class at all levels and the Circle of the L
 subclasses. Druid level, proficiency, ability modifiers, uses, temp HP, and max CR are read from your sheet
 each time you run a command.
 
-While shaped you keep your HP, Hit Dice, INT/WIS/CHA, class features, and feats; AC, physical stats, and
-attacks come from the beast. In combat this is applied as a single init effect with a Revert button.
+While shaped you keep your HP, Hit Dice, INT/WIS/CHA, class features, and feats; physical stats and attacks
+come from the beast. Your AC is the highest calculation that applies to you: the beast's AC, your subclass
+AC, and Unarmored Defense (Monk and Barbarian are detected automatically). In combat this is applied as a
+single init effect with a Revert button.
 
 ## Setup
 1. `!wildshape setup` creates the Wild Shape uses counter.
@@ -37,6 +39,9 @@ Forms are read from Avrae's compendium while in initiative, then stored on your 
 - Scan and learn run while in initiative; the beast is added to combat to read its stat block, then removed.
 - Pass `-cr` (and `-fly` for flying beasts) when scanning so the eligibility check against your level applies.
 - Skill checks while shaped use `!wildshape check`; in combat the effect adjusts automated saves directly.
+- AC while shaped is the highest applicable calculation. Monk and Barbarian Unarmored Defense are detected
+  automatically; declare other sources with `!wildshape setup -unarmored "13+dex"`. Per transform, `-ac <n>`
+  forces a value and `-noac` leaves your sheet AC unchanged.
 - Duration, the Incapacitated end condition, spellcasting, and equipment are shown as reminders.
 
 ## Issues
